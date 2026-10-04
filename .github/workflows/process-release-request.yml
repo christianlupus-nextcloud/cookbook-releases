@@ -1,0 +1,583 @@
+# SPDX-FileCopyrightText: 2026 Nextcloud cookbook contributors
+#
+# SPDX-License-Identifier: AGPL-3.0-only OR AGPL-3.0-or-later
+
+name: Process release request
+
+on:
+  issues:
+    types: [opened]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Release request issue number to retry
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: cookbook-release
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPOSITORY: nextcloud/cookbook
+  ALLOWED_BRANCHES: '["master"]'
+  ALLOWED_MERGERS: '["christianlupus", "seyfeb"]'
+
+jobs:
+  resolve-request:
+    name: Resolve release request issue
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.issue.title == 'release-request' && github.event.sender.login == vars.RELEASE_REQUEST_SENDER) }}
+    runs-on: ubuntu-24.04
+    permissions:
+      issues: read
+    outputs:
+      issue_number: ${{ steps.request.outputs.issue_number }}
+      issue_body: ${{ steps.request.outputs.issue_body }}
+      issue_sender: ${{ steps.request.outputs.issue_sender }}
+    steps:
+      - name: Resolve original release request
+        id: request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_ISSUE_NUMBER: ${{ inputs.issue_number }}
+          EVENT_ISSUE_NUMBER: ${{ github.event.issue.number }}
+          EVENT_ISSUE_TITLE: ${{ github.event.issue.title }}
+          EVENT_ISSUE_BODY: ${{ github.event.issue.body }}
+          EVENT_ISSUE_SENDER: ${{ github.event.sender.login }}
+          EXPECTED_SENDER: ${{ vars.RELEASE_REQUEST_SENDER }}
+        run: |
+          set -euo pipefail
+          issue_state=""
+          if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+            [[ "$DISPATCH_ISSUE_NUMBER" =~ ^[1-9][0-9]*$ ]]
+            issue=$(gh api "repos/${GITHUB_REPOSITORY}/issues/$DISPATCH_ISSUE_NUMBER")
+            issue_number=$(jq -r '.number' <<< "$issue")
+            issue_title=$(jq -r '.title // empty' <<< "$issue")
+            issue_state=$(jq -r '.state // empty' <<< "$issue")
+            issue_body=$(jq -r '.body // empty' <<< "$issue")
+            issue_sender=$(jq -r '.user.login // empty' <<< "$issue")
+          else
+            issue_number="$EVENT_ISSUE_NUMBER"
+            issue_title="$EVENT_ISSUE_TITLE"
+            issue_body="$EVENT_ISSUE_BODY"
+            issue_sender="$EVENT_ISSUE_SENDER"
+          fi
+
+          [[ "$issue_title" == release-request ]]
+          [[ -n "$EXPECTED_SENDER" && "$issue_sender" == "$EXPECTED_SENDER" ]]
+          if [[ "$EVENT_NAME" == workflow_dispatch && "$issue_state" != open ]]; then
+            echo "This release request is already closed and therefore considered successfully completed. Refusing to run recovery." >&2
+            exit 1
+          fi
+          issue_body_b64=$(printf '%s' "$issue_body" | base64 -w0)
+          {
+            printf 'issue_number=%s\n' "$issue_number"
+            printf 'issue_body=%s\n' "$issue_body_b64"
+            printf 'issue_sender=%s\n' "$issue_sender"
+          } >> "$GITHUB_OUTPUT"
+
+  processing:
+    name: Mark request as processing
+    needs: resolve-request
+    if: ${{ needs.resolve-request.result == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      issues: write
+    steps:
+      - name: Add processing reaction
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ needs.resolve-request.outputs.issue_number }}
+        run: |
+          set -euo pipefail
+          reactions=$(gh api "repos/${{ github.repository }}/issues/$ISSUE_NUMBER/reactions")
+          if ! jq -e 'any(.[]; .content == "eyes" and .user.login == "github-actions[bot]")' <<< "$reactions" >/dev/null; then
+            gh api "repos/${{ github.repository }}/issues/$ISSUE_NUMBER/reactions" --method POST --field content=eyes >/dev/null
+          fi
+
+      - name: Record manual recovery start
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ needs.resolve-request.outputs.issue_number }}
+          ACTOR: ${{ github.actor }}
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${GITHUB_REPOSITORY}/issues/$ISSUE_NUMBER/comments" \
+            --method POST \
+            --field body="🔄 Manual recovery run started by @$ACTOR. Workflow run: $SERVER_URL/$REPOSITORY/actions/runs/$RUN_ID"
+
+  validate:
+    name: Validate release request
+    needs: [resolve-request, processing]
+    if: ${{ needs.resolve-request.result == 'success' && needs.processing.result == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      issues: write
+    outputs:
+      tag: ${{ steps.metadata.outputs.tag }}
+      version: ${{ steps.metadata.outputs.version }}
+      sha: ${{ steps.metadata.outputs.sha }}
+    steps:
+      - name: Validate issue metadata and release authorization
+        id: metadata
+        env:
+          ISSUE_BODY_B64: ${{ needs.resolve-request.outputs.issue_body }}
+          ISSUE_SENDER: ${{ needs.resolve-request.outputs.issue_sender }}
+          EXPECTED_SENDER: ${{ vars.RELEASE_REQUEST_SENDER }}
+        run: |
+          set -euo pipefail
+
+          ISSUE_BODY=$(printf '%s' "$ISSUE_BODY_B64" | base64 --decode)
+          [[ -n "$EXPECTED_SENDER" && "$ISSUE_SENDER" == "$EXPECTED_SENDER" ]]
+          jq -e 'type == "object"' <<< "$ISSUE_BODY" >/dev/null
+          repository=$(jq -r '.repository // empty' <<< "$ISSUE_BODY")
+          branch=$(jq -r '.branch // empty' <<< "$ISSUE_BODY")
+          tag=$(jq -r '.tag // empty' <<< "$ISSUE_BODY")
+          version=$(jq -r '.version // empty' <<< "$ISSUE_BODY")
+          issue_sha=$(jq -r '.sha // empty' <<< "$ISSUE_BODY")
+
+          jq -e '.schema == 1' <<< "$ISSUE_BODY" >/dev/null
+          [[ "$repository" == "$SOURCE_REPOSITORY" ]]
+          jq -e --arg branch "$branch" 'index($branch) != null' <<< "$ALLOWED_BRANCHES" >/dev/null
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$version" == "${tag#v}" ]]
+          [[ "$issue_sha" =~ ^[0-9a-f]{40}$ ]]
+
+          github_api() {
+            curl --fail-with-body --silent --show-error \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'X-GitHub-Api-Version: 2026-03-10' \
+              "$1"
+          }
+
+          github_api_paginated() {
+            local url="$1" headers_file body_file link_header next_url
+            while [[ -n "$url" ]]; do
+              headers_file=$(mktemp)
+              body_file=$(mktemp)
+              curl --fail-with-body --silent --show-error \
+                --header 'Accept: application/vnd.github+json' \
+                --header 'X-GitHub-Api-Version: 2026-03-10' \
+                --dump-header "$headers_file" \
+                --output "$body_file" \
+                "$url"
+              cat "$body_file"
+              printf '\n'
+              link_header=$(grep -i '^link:' "$headers_file" | tail -n1 || true)
+              next_url=$(printf '%s\n' "$link_header" | grep -oE '<[^>]+>;[[:space:]]*rel="next"' | sed -E 's/^<([^>]+)>.*/\1/' || true)
+              rm -f "$headers_file" "$body_file"
+              url="$next_url"
+            done
+          }
+
+          # Resolve the tag independently; annotated tags point to a tag object, not directly to a commit.
+          tag_ref=$(github_api "https://api.github.com/repos/$SOURCE_REPOSITORY/git/ref/tags/$tag")
+          tag_type=$(jq -r '.object.type' <<< "$tag_ref")
+          tag_object=$(jq -r '.object.sha' <<< "$tag_ref")
+          while [[ "$tag_type" == tag ]]; do
+            tag_object_data=$(github_api "https://api.github.com/repos/$SOURCE_REPOSITORY/git/tags/$tag_object")
+            tag_type=$(jq -r '.object.type' <<< "$tag_object_data")
+            tag_object=$(jq -r '.object.sha' <<< "$tag_object_data")
+          done
+          [[ "$tag_type" == commit ]]
+          actual_sha="$tag_object"
+          [[ "$actual_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$actual_sha" == "$issue_sha" ]]
+
+          pull_numbers=$(github_api_paginated "https://api.github.com/repos/$SOURCE_REPOSITORY/commits/$actual_sha/pulls?per_page=100" | jq -s 'add | .[].number')
+          matching_pull=false
+          while IFS= read -r pull_number; do
+            [[ -n "$pull_number" ]] || continue
+            pull=$(github_api "https://api.github.com/repos/$SOURCE_REPOSITORY/pulls/$pull_number")
+            merged_at=$(jq -r '.merged_at // empty' <<< "$pull")
+            merger=$(jq -r '.merged_by.login // empty' <<< "$pull")
+            base=$(jq -r '.base.ref // empty' <<< "$pull")
+            merge_sha=$(jq -r '.merge_commit_sha // empty' <<< "$pull")
+            tagged_label=$(jq -r 'any(.labels[]?; .name == "autorelease: tagged")' <<< "$pull")
+            allowed_merger=$(jq -r --arg user "$merger" 'any(.[]; . == $user)' <<< "$ALLOWED_MERGERS")
+            if [[ -n "$merged_at" \
+              && "$base" == "$branch" \
+              && "$merge_sha" == "$actual_sha" \
+              && "$tagged_label" == true \
+              && "$allowed_merger" == true ]]; then
+              matching_pull=true
+              break
+            fi
+          done <<< "$pull_numbers"
+          [[ "$matching_pull" == true ]]
+
+          printf 'tag=%s\nversion=%s\nsha=%s\n' "$tag" "$version" "$actual_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Add validation success reaction
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ needs.resolve-request.outputs.issue_number }}
+        run: |
+          set -euo pipefail
+          reactions=$(gh api "repos/${{ github.repository }}/issues/$ISSUE_NUMBER/reactions")
+          if ! jq -e 'any(.[]; .content == "+1" and .user.login == "github-actions[bot]")' <<< "$reactions" >/dev/null; then
+            gh api "repos/${{ github.repository }}/issues/$ISSUE_NUMBER/reactions" --method POST --raw-field content=+1 >/dev/null
+          fi
+          gh api "repos/${{ github.repository }}/issues/$ISSUE_NUMBER/comments" \
+            --method POST \
+            --field body='✅ Release request validation succeeded. The source tag, commit, merged pull request, and release authorization checks passed.' >/dev/null
+
+  build:
+    name: Build unsigned release artifact
+    needs: validate
+    if: ${{ needs.validate.result == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - name: Checkout source tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          repository: nextcloud/cookbook
+          ref: ${{ needs.validate.outputs.sha }}
+          path: cookbook
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify checked-out source commit
+        working-directory: cookbook
+        env:
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$EXPECTED_SHA" ]]
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
+        with:
+          php-version: '8.5'
+          tools: composer
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '24'
+
+      - name: Install Composer dependencies
+        working-directory: cookbook
+        run: composer install --no-interaction --prefer-dist
+
+      - name: Install NPM dependencies
+        working-directory: cookbook
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: cookbook
+        run: npm run build
+
+      - name: Build distribution
+        working-directory: cookbook
+        run: make appstore
+
+      - name: Upload unsigned tarball
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cookbook-${{ needs.validate.outputs.version }}
+          path: cookbook/build/artifacts/appstore/cookbook.tar.gz
+          if-no-files-found: error
+
+  approval-notice:
+    name: Report build completion and approval wait
+    needs: [resolve-request, validate, build]
+    if: ${{ needs.validate.result == 'success' && needs.build.result == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      issues: write
+    steps:
+      - name: Comment that the build is ready for approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ needs.resolve-request.outputs.issue_number }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${GITHUB_REPOSITORY}/issues/$ISSUE_NUMBER/comments" \
+            --method POST \
+            --field body="✅ Build for cookbook $VERSION completed. The release is waiting for approval in the release-publish environment."
+
+  publish:
+    name: Sign and publish release
+    needs: [resolve-request, validate, build, approval-notice]
+    if: ${{ needs.validate.result == 'success' && needs.build.result == 'success' && needs.approval-notice.result == 'success' }}
+    environment: release-publish
+    runs-on: ubuntu-24.04
+    permissions:
+      issues: write
+    steps:
+      - name: Download unsigned tarball
+        id: download
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: cookbook-${{ needs.validate.outputs.version }}
+          path: artifact
+
+      - name: Create internal artifact integrity metadata
+        run: |
+          # Intentionally unimplemented; do not modify the tarball at this stage.
+          echo "NOP: internal artifact integrity metadata will be added later"
+
+      - name: Create GitHub App token for main repo
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.RELEASE_PUBLISH_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PUBLISH_APP_PRIVATE_KEY }}
+          owner: nextcloud
+          repositories: cookbook
+          permission-contents: write
+
+      - name: Revalidate source tag before privileged release operations
+        id: revalidate-tag
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          tag_ref=$(gh api "repos/nextcloud/cookbook/git/ref/tags/$TAG")
+          tag_type=$(jq -r '.object.type' <<< "$tag_ref")
+          tag_object=$(jq -r '.object.sha' <<< "$tag_ref")
+          while [[ "$tag_type" == tag ]]; do
+            tag_object_data=$(gh api "repos/nextcloud/cookbook/git/tags/$tag_object")
+            tag_type=$(jq -r '.object.type' <<< "$tag_object_data")
+            tag_object=$(jq -r '.object.sha' <<< "$tag_object_data")
+          done
+          [[ "$tag_type" == commit ]]
+          [[ "$tag_object" == "$EXPECTED_SHA" ]]
+
+      - name: Find and verify release state on repo A
+        id: release-state
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ISSUE_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ needs.resolve-request.outputs.issue_number }}
+          EVENT_NAME: ${{ github.event_name }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          fail_release() {
+            local message="$1"
+            GH_TOKEN="$ISSUE_TOKEN" gh api "repos/${GITHUB_REPOSITORY}/issues/$ISSUE_NUMBER/comments" \
+              --method POST --field body="$message" >/dev/null || true
+            echo "$message" >&2
+            exit 1
+          }
+
+          if ! releases=$(gh api --paginate "repos/nextcloud/cookbook/releases?per_page=100" | jq -s 'add'); then
+            fail_release "❌ Unexpected GitHub release state for $TAG: the release list could not be retrieved. No publication was attempted; the request remains open."
+          fi
+          matching=$(jq --arg tag "$TAG" '[.[] | select(.tag_name == $tag)]' <<< "$releases")
+          match_count=$(jq 'length' <<< "$matching")
+          if [[ "$match_count" -ne 1 ]]; then
+            fail_release "❌ Unexpected GitHub release state for $TAG: expected exactly one matching release, found $match_count. No release publication was attempted; the request remains open."
+          fi
+          release=$(jq '.[0]' <<< "$matching")
+          release_tag=$(jq -r '.tag_name // empty' <<< "$release")
+          draft=$(jq -r '.draft | if type == "boolean" then tostring else "invalid" end' <<< "$release")
+          if [[ "$release_tag" != "$TAG" || ( "$draft" != true && "$draft" != false ) ]]; then
+            fail_release "❌ Unexpected GitHub release state for $TAG: the release tag or draft status is inconsistent. No release publication was attempted; the request remains open."
+          fi
+          release_id=$(jq -r '.id' <<< "$release")
+          if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
+            fail_release "❌ Unexpected GitHub release state for $TAG: the release ID could not be verified. No release publication was attempted; the request remains open."
+          fi
+
+          if ! assets=$(gh api --paginate "repos/nextcloud/cookbook/releases/$release_id/assets?per_page=100" | jq -s 'add'); then
+            fail_release "❌ Unexpected GitHub release state for $TAG: its assets could not be verified. No publication was attempted; the request remains open."
+          fi
+          tarball_count=$(jq '[.[] | select(.name == "cookbook.tar.gz")] | length' <<< "$assets")
+          if [[ "$draft" == false ]]; then
+            if [[ "$tarball_count" -ne 1 ]]; then
+              fail_release "❌ Recovery found published GitHub release $TAG, but its tarball is missing or duplicated. The public release was not modified; investigate before retrying."
+            fi
+            if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+              state_comment="⚠️ Recovery run detected that GitHub release $TAG is already published. Its tarball is present exactly once. Skipping GitHub publication and continuing with remaining release steps."
+            else
+              state_comment="⚠️ GitHub release $TAG is already published, with its tarball present exactly once. Skipping GitHub publication and continuing with remaining release steps."
+            fi
+            GH_TOKEN="$ISSUE_TOKEN" gh api "repos/${GITHUB_REPOSITORY}/issues/$ISSUE_NUMBER/comments" \
+              --method POST --field body="$state_comment" >/dev/null
+          fi
+
+          printf 'release_id=%s\n' "$release_id" >> "$GITHUB_OUTPUT"
+          printf 'is_draft=%s\n' "$draft" >> "$GITHUB_OUTPUT"
+          if [[ "$tarball_count" -gt 0 ]]; then
+            printf 'had_assets=true\n' >> "$GITHUB_OUTPUT"
+          else
+            printf 'had_assets=false\n' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload tarball to verified draft release
+        id: upload-tarball
+        if: ${{ steps.release-state.outputs.is_draft == 'true' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RELEASE_ID: ${{ steps.release-state.outputs.release_id }}
+          ASSET_NAME: cookbook.tar.gz
+        run: |
+          set -euo pipefail
+          assets=$(gh api --paginate "repos/nextcloud/cookbook/releases/$RELEASE_ID/assets?per_page=100" | jq -s 'add')
+          asset_ids=$(jq -r --arg name "$ASSET_NAME" '.[] | select(.name == $name) | .id' <<< "$assets")
+          while IFS= read -r asset_id; do
+            [[ -n "$asset_id" ]] || continue
+            gh api "repos/nextcloud/cookbook/releases/assets/$asset_id" --method DELETE >/dev/null
+          done <<< "$asset_ids"
+          gh api --hostname uploads.github.com \
+            --method POST \
+            "repos/nextcloud/cookbook/releases/$RELEASE_ID/assets?name=cookbook.tar.gz" \
+            --header 'Content-Type: application/gzip' \
+            --input artifact/cookbook.tar.gz >/dev/null
+
+      - name: Publish existing draft release on repo A
+        id: publish-github
+        if: ${{ steps.release-state.outputs.is_draft == 'true' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RELEASE_ID: ${{ steps.release-state.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          gh api "repos/nextcloud/cookbook/releases/$RELEASE_ID" \
+            --method PATCH --field draft=false --jq '.draft' \
+            | grep -qx false
+
+      - name: Report replaced assets during recovery
+        if: ${{ github.event_name == 'workflow_dispatch' && steps.release-state.outputs.is_draft == 'true' && steps.release-state.outputs.had_assets == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ needs.resolve-request.outputs.issue_number }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${GITHUB_REPOSITORY}/issues/$ISSUE_NUMBER/comments" \
+            --method POST \
+            --field body="✅ Recovery replaced the expected tarball assets on the draft GitHub release $TAG."
+
+      - name: Report GitHub release publication
+        if: ${{ steps.release-state.outputs.is_draft == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ needs.resolve-request.outputs.issue_number }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${GITHUB_REPOSITORY}/issues/$ISSUE_NUMBER/comments" \
+            --method POST \
+            --field body="✅ GitHub release $TAG is now public with its tarball. Continuing with Nextcloud App Store registration."
+
+      - name: Upload app to Nextcloud app store
+        id: appstore
+        continue-on-error: true
+        uses: nextcloud-releases/nextcloud-appstore-push-action@a011fe619bcf6e77ddebc96f9908e1af4071b9c1 # v1
+        with:
+          app_name: cookbook
+          appstore_token: ${{ secrets.APPSTORE_TOKEN }}
+          download_url: https://github.com/nextcloud/cookbook/releases/download/${{ needs.validate.outputs.tag }}/cookbook.tar.gz
+          app_private_key: ${{ secrets.PRIVATE_KEY }}
+
+      - name: Report App Store publication failure
+        if: ${{ steps.appstore.outcome == 'failure' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ needs.resolve-request.outputs.issue_number }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${GITHUB_REPOSITORY}/issues/$ISSUE_NUMBER/comments" \
+            --method POST \
+            --field body="❌ Nextcloud App Store registration failed for $TAG. The GitHub release is already public; the request remains open for a recovery run."
+          exit 1
+
+      - name: Report GitHub publication failure
+        if: ${{ failure() && steps.appstore.outcome != 'failure' && steps.release-state.outcome != 'failure' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ needs.resolve-request.outputs.issue_number }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+          APP_TOKEN_OUTCOME: ${{ steps.app-token.outcome }}
+          REVALIDATE_OUTCOME: ${{ steps.revalidate-tag.outcome }}
+          TARBALL_OUTCOME: ${{ steps.upload-tarball.outcome }}
+          GITHUB_PUBLISH_OUTCOME: ${{ steps.publish-github.outcome }}
+        run: |
+          set -euo pipefail
+          if [[ "$DOWNLOAD_OUTCOME" == failure ]]; then
+            detail="The built artifact could not be downloaded; no signing or publication was completed."
+          elif [[ "$APP_TOKEN_OUTCOME" == failure ]]; then
+            detail="The scoped GitHub App token could not be created; no signing or publication was completed."
+          elif [[ "$REVALIDATE_OUTCOME" == failure ]]; then
+            detail="The source tag no longer resolves to the validated commit; no signing or publication was completed."
+          elif [[ "$TARBALL_OUTCOME" == failure ]]; then
+            detail="The release tarball could not be uploaded; the GitHub release may still be a draft."
+          elif [[ "$GITHUB_PUBLISH_OUTCOME" == failure ]]; then
+            detail="The GitHub release could not be made public; the App Store step was not completed."
+          else
+            detail="A GitHub publication step failed; review the workflow run for the completed stage."
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/issues/$ISSUE_NUMBER/comments" \
+            --method POST \
+            --field body="❌ Release processing failed for $TAG. $detail The request remains open for investigation or recovery."
+
+  status:
+    name: Report release request status
+    needs: [resolve-request, processing, validate, build, approval-notice, publish]
+    if: ${{ always() && needs.resolve-request.result == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      issues: write
+    steps:
+      - name: React and close only after complete success
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ needs.resolve-request.outputs.issue_number }}
+          PROCESSING_RESULT: ${{ needs.processing.result }}
+          VALIDATE_RESULT: ${{ needs.validate.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          APPROVAL_NOTICE_RESULT: ${{ needs.approval-notice.result }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          reactions=$(gh api "repos/${{ github.repository }}/issues/$ISSUE_NUMBER/reactions")
+          if [[ "$PROCESSING_RESULT" == success \
+            && "$VALIDATE_RESULT" == success \
+            && "$BUILD_RESULT" == success \
+            && "$APPROVAL_NOTICE_RESULT" == success \
+            && "$PUBLISH_RESULT" == success ]]; then
+            if ! jq -e 'any(.[]; .content == "hooray" and .user.login == "github-actions[bot]")' <<< "$reactions" >/dev/null; then
+              gh api "repos/${{ github.repository }}/issues/$ISSUE_NUMBER/reactions" --method POST --field content=hooray >/dev/null
+            fi
+            gh api "repos/${{ github.repository }}/issues/$ISSUE_NUMBER/comments" \
+              --method POST \
+              --field body="🎉 Release $TAG completed successfully, including GitHub publication and Nextcloud App Store registration."
+            gh api "repos/${{ github.repository }}/issues/$ISSUE_NUMBER" --method PATCH --field state=closed >/dev/null
+          else
+            if ! jq -e 'any(.[]; .content == "-1" and .user.login == "github-actions[bot]")' <<< "$reactions" >/dev/null; then
+              gh api "repos/${{ github.repository }}/issues/$ISSUE_NUMBER/reactions" --method POST --raw-field content=-1 >/dev/null
+            fi
+            if [[ "$VALIDATE_RESULT" != success ]]; then
+              failure_message="❌ Release request validation failed. No build or publication was performed; the issue remains open. Review the workflow run and correct the original request before retrying."
+            elif [[ "$BUILD_RESULT" != success ]]; then
+              failure_message="❌ Build failed for release $TAG. No GitHub release or App Store publication was completed; the issue remains open. Review the workflow run before retrying."
+            elif [[ "$APPROVAL_NOTICE_RESULT" != success ]]; then
+              failure_message="❌ The build for release $TAG completed, but the workflow could not report or proceed to environment approval. No publication was completed; the issue remains open."
+            elif [[ "$PUBLISH_RESULT" != success ]]; then
+              failure_message="❌ Release processing failed for $TAG. GitHub publication may already be complete; the workflow comments above identify any completed stage. The issue remains open for investigation or recovery."
+            else
+              failure_message="❌ Release processing did not complete for this request. The issue remains open for investigation."
+            fi
+            gh api "repos/${{ github.repository }}/issues/$ISSUE_NUMBER/comments" \
+              --method POST --field body="$failure_message" >/dev/null
+            echo "$failure_message" >&2
+            exit 1
+          fi
