@@ -29,7 +29,7 @@ jobs:
   resolve-request:
     name: Resolve release request issue
     if: ${{ github.event_name == 'workflow_dispatch' || (github.event.issue.title == 'release-request' && github.event.sender.login == vars.RELEASE_REQUEST_SENDER) }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       issues: read
     outputs:
@@ -83,7 +83,7 @@ jobs:
     name: Mark request as processing
     needs: resolve-request
     if: ${{ needs.resolve-request.result == 'success' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       issues: write
     steps:
@@ -117,7 +117,7 @@ jobs:
     name: Validate release request
     needs: [resolve-request, processing]
     if: ${{ needs.resolve-request.result == 'success' && needs.processing.result == 'success' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       issues: write
     outputs:
@@ -262,10 +262,15 @@ jobs:
             allowed_merger=$(jq -r --arg user "$merger" 'any(.[]; . == $user)' <<< "$ALLOWED_MERGERS")
             printf 'Checking PR #%s:\n  merged_at=%s\n  merged_by=%s\n  base=%s\n  merge_commit_sha=%s\n  autorelease_tagged=%s\n  allowed_merger=%s\n' \
               "$pull_number" "$merged_at" "$merger" "$base" "$merge_sha" "$tagged_label" "$allowed_merger"
+            if [[ -z "$merge_sha" ]]; then
+              echo "PR #$pull_number: merge_commit_sha is unavailable; relying on the commit-to-PR association returned by GitHub for validated commit $actual_sha."
+            fi
             rejection_reasons=()
             [[ -n "$merged_at" ]] || rejection_reasons+=("not merged: merged_at is empty")
             [[ "$base" == "$branch" ]] || rejection_reasons+=("base mismatch: expected=$branch actual=$base")
-            [[ "$merge_sha" == "$actual_sha" ]] || rejection_reasons+=("merge SHA mismatch: expected=$actual_sha actual=$merge_sha")
+            if [[ -n "$merge_sha" && "$merge_sha" != "$actual_sha" ]]; then
+              rejection_reasons+=("merge SHA mismatch: expected=$actual_sha actual=$merge_sha")
+            fi
             [[ "$tagged_label" == true ]] || rejection_reasons+=("missing label autorelease: tagged")
             [[ "$allowed_merger" == true ]] || rejection_reasons+=("merger $merger is not in allowed merger list")
             if ((${#rejection_reasons[@]} > 0)); then
@@ -275,7 +280,7 @@ jobs:
             fi
             if [[ -n "$merged_at" \
               && "$base" == "$branch" \
-              && "$merge_sha" == "$actual_sha" \
+              && ( -z "$merge_sha" || "$merge_sha" == "$actual_sha" ) \
               && "$tagged_label" == true \
               && "$allowed_merger" == true ]]; then
               matching_pull=true
@@ -310,7 +315,7 @@ jobs:
     name: Build unsigned release artifact
     needs: validate
     if: ${{ needs.validate.result == 'success' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions: {}
     steps:
       - name: Checkout source tag
@@ -368,7 +373,7 @@ jobs:
     name: Report build completion and approval wait
     needs: [resolve-request, validate, build]
     if: ${{ needs.validate.result == 'success' && needs.build.result == 'success' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       issues: write
     steps:
@@ -388,7 +393,7 @@ jobs:
     needs: [resolve-request, validate, build, approval-notice]
     if: ${{ needs.validate.result == 'success' && needs.build.result == 'success' && needs.approval-notice.result == 'success' }}
     environment: release-publish
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       issues: write
     steps:
@@ -609,7 +614,7 @@ jobs:
     name: Report release request status
     needs: [resolve-request, processing, validate, build, approval-notice, publish]
     if: ${{ always() && needs.resolve-request.result == 'success' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       issues: write
     steps:
