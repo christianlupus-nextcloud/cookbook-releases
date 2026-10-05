@@ -135,39 +135,81 @@ jobs:
           set -euo pipefail
 
           ISSUE_BODY=$(printf '%s' "$ISSUE_BODY_B64" | base64 --decode)
-          [[ -n "$EXPECTED_SENDER" && "$ISSUE_SENDER" == "$EXPECTED_SENDER" ]]
-          jq -e 'type == "object"' <<< "$ISSUE_BODY" >/dev/null
+          if ! jq -e 'type == "object"' <<< "$ISSUE_BODY" >/dev/null; then
+            echo "Invalid release request JSON: expected an object" >&2
+            exit 1
+          fi
           repository=$(jq -r '.repository // empty' <<< "$ISSUE_BODY")
           branch=$(jq -r '.branch // empty' <<< "$ISSUE_BODY")
           tag=$(jq -r '.tag // empty' <<< "$ISSUE_BODY")
           version=$(jq -r '.version // empty' <<< "$ISSUE_BODY")
           issue_sha=$(jq -r '.sha // empty' <<< "$ISSUE_BODY")
 
-          jq -e '.schema == 1' <<< "$ISSUE_BODY" >/dev/null
-          [[ "$repository" == "$SOURCE_REPOSITORY" ]]
-          jq -e --arg branch "$branch" 'index($branch) != null' <<< "$ALLOWED_BRANCHES" >/dev/null
-          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          [[ "$version" == "${tag#v}" ]]
-          [[ "$issue_sha" =~ ^[0-9a-f]{40}$ ]]
+          printf 'Validating release request:\n  repository=%s\n  branch=%s\n  tag=%s\n  version=%s\n  issue_sha=%s\n  sender=%s\n' \
+            "$repository" "$branch" "$tag" "$version" "$issue_sha" "$ISSUE_SENDER"
+
+          if [[ -z "$EXPECTED_SENDER" || "$ISSUE_SENDER" != "$EXPECTED_SENDER" ]]; then
+            echo "Invalid release request sender: sender=$ISSUE_SENDER" >&2
+            exit 1
+          fi
+          if ! jq -e '.schema == 1' <<< "$ISSUE_BODY" >/dev/null; then
+            echo "Invalid release request schema: expected=1" >&2
+            exit 1
+          fi
+          if [[ "$repository" != "$SOURCE_REPOSITORY" ]]; then
+            echo "Invalid release request repository: expected=$SOURCE_REPOSITORY actual=$repository" >&2
+            exit 1
+          fi
+          if ! jq -e --arg branch "$branch" 'index($branch) != null' <<< "$ALLOWED_BRANCHES" >/dev/null; then
+            echo "Invalid release request branch: branch=$branch is not allowed" >&2
+            exit 1
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release request tag format: tag=$tag" >&2
+            exit 1
+          fi
+          if [[ "$version" != "${tag#v}" ]]; then
+            echo "Release request version does not match tag: tag=$tag expected=${tag#v} actual=$version" >&2
+            exit 1
+          fi
+          if [[ ! "$issue_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid release request SHA format: issue_sha=$issue_sha" >&2
+            exit 1
+          fi
 
           github_api() {
-            curl --fail-with-body --silent --show-error \
+            local operation="$1" url="$2" body_file
+            body_file=$(mktemp)
+            if ! curl --fail-with-body --silent --show-error \
               --header 'Accept: application/vnd.github+json' \
               --header 'X-GitHub-Api-Version: 2026-03-10' \
-              "$1"
+              --output "$body_file" \
+              "$url"; then
+              cat "$body_file" >&2
+              rm -f "$body_file"
+              echo "Failed to $operation" >&2
+              return 1
+            fi
+            cat "$body_file"
+            rm -f "$body_file"
           }
 
           github_api_paginated() {
-            local url="$1" headers_file body_file link_header next_url
+            local operation="$1" url="$2" headers_file body_file link_header next_url
             while [[ -n "$url" ]]; do
               headers_file=$(mktemp)
               body_file=$(mktemp)
-              curl --fail-with-body --silent --show-error \
+              if ! curl --fail-with-body --silent --show-error \
                 --header 'Accept: application/vnd.github+json' \
                 --header 'X-GitHub-Api-Version: 2026-03-10' \
                 --dump-header "$headers_file" \
                 --output "$body_file" \
-                "$url"
+                "$url"; then
+                cat "$body_file" >&2
+                rm -f "$headers_file" "$body_file"
+                echo "Failed to $operation" >&2
+                return 1
+              fi
               cat "$body_file"
               printf '\n'
               link_header=$(grep -i '^link:' "$headers_file" | tail -n1 || true)
@@ -178,41 +220,76 @@ jobs:
           }
 
           # Resolve the tag independently; annotated tags point to a tag object, not directly to a commit.
-          tag_ref=$(github_api "https://api.github.com/repos/$SOURCE_REPOSITORY/git/ref/tags/$tag")
+          tag_ref=$(github_api "resolve tag $tag from $SOURCE_REPOSITORY" "https://api.github.com/repos/$SOURCE_REPOSITORY/git/ref/tags/$tag")
           tag_type=$(jq -r '.object.type' <<< "$tag_ref")
           tag_object=$(jq -r '.object.sha' <<< "$tag_ref")
           while [[ "$tag_type" == tag ]]; do
-            tag_object_data=$(github_api "https://api.github.com/repos/$SOURCE_REPOSITORY/git/tags/$tag_object")
+            tag_object_data=$(github_api "resolve annotated tag object $tag_object" "https://api.github.com/repos/$SOURCE_REPOSITORY/git/tags/$tag_object")
             tag_type=$(jq -r '.object.type' <<< "$tag_object_data")
             tag_object=$(jq -r '.object.sha' <<< "$tag_object_data")
           done
-          [[ "$tag_type" == commit ]]
+          if [[ "$tag_type" != commit ]]; then
+            echo "Invalid resolved tag object type: tag=$tag type=$tag_type expected=commit" >&2
+            exit 1
+          fi
           actual_sha="$tag_object"
-          [[ "$actual_sha" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$actual_sha" == "$issue_sha" ]]
+          if [[ ! "$actual_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid resolved tag SHA format: tag=$tag resolved_sha=$actual_sha" >&2
+            exit 1
+          fi
+          printf 'Resolved tag:\n  tag=%s\n  type=%s\n  commit_sha=%s\n' "$tag" "$tag_type" "$actual_sha"
+          if [[ "$actual_sha" != "$issue_sha" ]]; then
+            echo "Tag SHA mismatch: issue_sha=$issue_sha resolved_sha=$actual_sha" >&2
+            exit 1
+          fi
 
-          pull_numbers=$(github_api_paginated "https://api.github.com/repos/$SOURCE_REPOSITORY/commits/$actual_sha/pulls?per_page=100" | jq -s 'add | .[].number')
+          pull_numbers=$(github_api_paginated "query pull requests associated with commit $actual_sha" "https://api.github.com/repos/$SOURCE_REPOSITORY/commits/$actual_sha/pulls?per_page=100" | jq -s 'add | .[].number')
+          pull_number_list=${pull_numbers//$'\n'/, }
+          printf 'Associated pull requests for %s: %s\n' "$actual_sha" "$pull_number_list"
+          if [[ -z "$pull_numbers" ]]; then
+            echo "No pull request is associated with validated commit $actual_sha" >&2
+            exit 1
+          fi
           matching_pull=false
           while IFS= read -r pull_number; do
             [[ -n "$pull_number" ]] || continue
-            pull=$(github_api "https://api.github.com/repos/$SOURCE_REPOSITORY/pulls/$pull_number")
+            pull=$(github_api "load pull request #$pull_number" "https://api.github.com/repos/$SOURCE_REPOSITORY/pulls/$pull_number")
             merged_at=$(jq -r '.merged_at // empty' <<< "$pull")
             merger=$(jq -r '.merged_by.login // empty' <<< "$pull")
             base=$(jq -r '.base.ref // empty' <<< "$pull")
             merge_sha=$(jq -r '.merge_commit_sha // empty' <<< "$pull")
             tagged_label=$(jq -r 'any(.labels[]?; .name == "autorelease: tagged")' <<< "$pull")
             allowed_merger=$(jq -r --arg user "$merger" 'any(.[]; . == $user)' <<< "$ALLOWED_MERGERS")
+            printf 'Checking PR #%s:\n  merged_at=%s\n  merged_by=%s\n  base=%s\n  merge_commit_sha=%s\n  autorelease_tagged=%s\n  allowed_merger=%s\n' \
+              "$pull_number" "$merged_at" "$merger" "$base" "$merge_sha" "$tagged_label" "$allowed_merger"
+            rejection_reasons=()
+            [[ -n "$merged_at" ]] || rejection_reasons+=("not merged: merged_at is empty")
+            [[ "$base" == "$branch" ]] || rejection_reasons+=("base mismatch: expected=$branch actual=$base")
+            [[ "$merge_sha" == "$actual_sha" ]] || rejection_reasons+=("merge SHA mismatch: expected=$actual_sha actual=$merge_sha")
+            [[ "$tagged_label" == true ]] || rejection_reasons+=("missing label autorelease: tagged")
+            [[ "$allowed_merger" == true ]] || rejection_reasons+=("merger $merger is not in allowed merger list")
+            if ((${#rejection_reasons[@]} > 0)); then
+              printf 'PR #%s rejected:\n' "$pull_number" >&2
+              printf '  %s\n' "${rejection_reasons[@]}" >&2
+              continue
+            fi
             if [[ -n "$merged_at" \
               && "$base" == "$branch" \
               && "$merge_sha" == "$actual_sha" \
               && "$tagged_label" == true \
               && "$allowed_merger" == true ]]; then
               matching_pull=true
+              echo "Authorized release PR found: #$pull_number"
               break
             fi
           done <<< "$pull_numbers"
-          [[ "$matching_pull" == true ]]
+          if [[ "$matching_pull" != true ]]; then
+            echo "No associated pull request passed release authorization checks for commit $actual_sha" >&2
+            exit 1
+          fi
 
+          printf 'Release request validation succeeded:\n  tag=%s\n  version=%s\n  sha=%s\n  branch=%s\n' \
+            "$tag" "$version" "$actual_sha" "$branch"
           printf 'tag=%s\nversion=%s\nsha=%s\n' "$tag" "$version" "$actual_sha" >> "$GITHUB_OUTPUT"
 
       - name: Add validation success reaction
