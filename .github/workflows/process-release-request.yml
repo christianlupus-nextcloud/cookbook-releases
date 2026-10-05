@@ -515,11 +515,14 @@ jobs:
             [[ -n "$asset_id" ]] || continue
             gh api "repos/nextcloud/cookbook/releases/assets/$asset_id" --method DELETE >/dev/null
           done <<< "$asset_ids"
-          gh api --hostname uploads.github.com \
-            --method POST \
-            "repos/nextcloud/cookbook/releases/$RELEASE_ID/assets?name=cookbook.tar.gz" \
-            --header 'Content-Type: application/gzip' \
-            --input artifact/cookbook.tar.gz >/dev/null
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "X-GitHub-Api-Version: 2026-03-10" \
+            --header "Content-Type: application/gzip" \
+            --data-binary @artifact/cookbook.tar.gz \
+            "https://uploads.github.com/repos/nextcloud/cookbook/releases/$RELEASE_ID/assets?name=cookbook.tar.gz"
 
       - name: Publish existing draft release on repo A
         id: publish-github
