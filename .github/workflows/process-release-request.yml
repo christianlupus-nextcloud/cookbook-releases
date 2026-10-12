@@ -348,7 +348,7 @@ jobs:
 
       - name: Install Composer dependencies
         working-directory: cookbook
-        run: composer install --no-interaction --prefer-dist
+        run: composer install --no-interaction --prefer-dist --no-dev
 
       - name: Install NPM dependencies
         working-directory: cookbook
